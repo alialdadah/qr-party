@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="theme-color" content="#0a0a0a">
+<title>Party Scanner</title>
+<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+    margin: 0; padding: 16px;
+    background: #0a0a0a; color: #fff;
+    min-height: 100vh;
+  }
+  .container { max-width: 480px; margin: 0 auto; }
+  h1 { font-size: 22px; font-weight: 700; margin: 0 0 20px; }
+  input, button {
+    font-size: 16px; padding: 14px; width: 100%;
+    border-radius: 10px; border: none; margin-bottom: 10px;
+    font-family: inherit;
+  }
+  input { background: #1f1f1f; color: #fff; border: 1px solid #333; }
+  input:focus { outline: none; border-color: #6366f1; }
+  button { background: #6366f1; color: #fff; font-weight: 600; cursor: pointer; }
+  button:hover { background: #4f46e5; }
+  button.secondary { background: #262626; }
+  #reader { width: 100%; border-radius: 12px; overflow: hidden; background: #000; }
+  #reader video { border-radius: 12px; }
+  .result {
+    padding: 24px; border-radius: 14px; text-align: center;
+    margin-top: 16px; font-size: 16px; animation: pop 0.2s ease-out;
+  }
+  @keyframes pop {
+    from { transform: scale(0.95); opacity: 0; }
+    to { transform: scale(1); opacity: 1; }
+  }
+  .ok { background: #16a34a; }
+  .duplicate { background: #ca8a04; }
+  .invalid { background: #dc2626; }
+  .icon { font-size: 40px; margin-bottom: 8px; }
+  .name { font-size: 26px; font-weight: 700; margin: 8px 0; }
+  .reason { font-size: 14px; opacity: 0.9; margin-top: 4px; }
+  .stats {
+    font-size: 13px; opacity: 0.6; text-align: center;
+    margin: 16px 0; padding: 8px; background: #1a1a1a; border-radius: 8px;
+  }
+  .gate { padding-top: 60px; }
+  .hint { font-size: 12px; opacity: 0.5; margin-top: -6px; margin-bottom: 12px; }
+</style>
+</head>
+<body>
+
+<div id="gate" class="container gate">
+  <h1>Door staff sign-in</h1>
+  <input id="apiUrl" placeholder="API URL (https://...)">
+  <div class="hint">Your deployed backend URL, no trailing slash</div>
+  <input id="pin" type="password" placeholder="Staff PIN" inputmode="numeric">
+  <input id="name" placeholder="Your name (for the log)">
+  <button onclick="enter()">Start scanning</button>
+</div>
+
+<div id="scanner" class="container" style="display:none;">
+  <h1>Scan QR</h1>
+  <div id="reader"></div>
+  <div id="result"></div>
+  <div id="stats" class="stats">Loading...</div>
+  <button class="secondary" onclick="logout()">Sign out</button>
+</div>
+
+<script>
+let api = '', pin = '', scannerName = '';
+let lastScan = 0;
+let lastPayload = '';
+let qrScanner = null;
+let audioCtx = null;
+
+function beep(frequency, duration, type = 'sine') {
+  // Web Audio works on iOS but must be initialized after a user gesture.
+  if (!audioCtx) {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    audioCtx = new Ctx();
+  }
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = type;
+  osc.frequency.value = frequency;
+  gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+  osc.connect(gain).connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + duration);
+}
+
+function feedback(kind) {
+  // Audio works everywhere; vibration is a bonus on Android.
+  if (kind === 'ok') {
+    beep(880, 0.15);
+    if (navigator.vibrate) navigator.vibrate([100, 50, 100]);
+  } else if (kind === 'duplicate') {
+    beep(440, 0.2);
+    setTimeout(() => beep(440, 0.2), 220);
+    if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
+  } else {
+    beep(200, 0.4, 'sawtooth');
+    if (navigator.vibrate) navigator.vibrate([300]);
+  }
+}
+
+function enter() {
+  api = document.getElementById('apiUrl').value.trim().replace(/\/$/, '');
+  pin = document.getElementById('pin').value.trim();
+  scannerName = document.getElementById('name').value.trim() || 'door';
+
+  if (!api || !pin) {
+    alert('Fill in API URL and PIN.');
+    return;
+  }
+
+  localStorage.setItem('api', api);
+  localStorage.setItem('pin', pin);
+  localStorage.setItem('name', scannerName);
+
+  document.getElementById('gate').style.display = 'none';
+  document.getElementById('scanner').style.display = 'block';
+
+  refreshStats();
+  startScanner();
+}
+
+function logout() {
+  if (qrScanner) qrScanner.stop().catch(() => {});
+  localStorage.clear();
+  location.reload();
+}
+
+function startScanner() {
+  qrScanner = new Html5Qrcode("reader");
+  qrScanner.start(
+    { facingMode: "environment" },
+    { fps: 10, qrbox: { width: 260, height: 260 } },
+    onScan,
+    () => {}
+  ).catch(err => {
+    alert('Camera error: ' + err);
+  });
+}
+
+async function onScan(decodedText) {
+  const now = Date.now();
+  // Debounce: ignore same code within 3s, or any code within 1s
+  if (decodedText === lastPayload && now - lastScan < 3000) return;
+  if (now - lastScan < 1000) return;
+  lastScan = now;
+  lastPayload = decodedText;
+
+  try {
+    const res = await fetch(`${api}/verify`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Staff-Pin': pin,
+      },
+      body: JSON.stringify({ payload: decodedText, scanner_name: scannerName }),
+    });
+
+    if (res.status === 401) {
+      showResult({ status: 'invalid', reason: 'Staff PIN rejected' });
+      return;
+    }
+
+    const data = await res.json();
+    showResult(data);
+    refreshStats();
+  } catch (e) {
+    showResult({ status: 'invalid', reason: 'Network error: ' + e.message });
+  }
+}
+
+function showResult(data) {
+  const el = document.getElementById('result');
+  let html = '';
+
+  if (data.status === 'ok') {
+    html = `
+      <div class="result ok">
+        <div class="icon">✓</div>
+        <div>Welcome</div>
+        <div class="name">${escapeHtml(data.name)}</div>
+      </div>`;
+    feedback('ok');
+  } else if (data.status === 'duplicate') {
+    const t = new Date(data.scanned_at).toLocaleTimeString();
+    html = `
+      <div class="result duplicate">
+        <div class="icon">⚠</div>
+        <div>Already scanned</div>
+        <div class="name">${escapeHtml(data.name)}</div>
+        <div class="reason">at ${t} by ${escapeHtml(data.scanned_by || 'unknown')}</div>
+      </div>`;
+    feedback('duplicate');
+  } else {
+    html = `
+      <div class="result invalid">
+        <div class="icon">✗</div>
+        <div>Rejected</div>
+        <div class="reason">${escapeHtml(data.reason || 'Unknown')}</div>
+      </div>`;
+    feedback('invalid');
+  }
+
+  el.innerHTML = html;
+  setTimeout(() => {
+    if (el.innerHTML === html) el.innerHTML = '';
+  }, 6000);
+}
+
+async function refreshStats() {
+  try {
+    const res = await fetch(`${api}/stats`, { headers: { 'X-Staff-Pin': pin }});
+    if (!res.ok) return;
+    const data = await res.json();
+    document.getElementById('stats').textContent =
+      `${data.scanned} / ${data.total} arrived  ·  ${data.remaining} remaining`;
+  } catch {}
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+
+// Pre-fill saved credentials but DO NOT auto-start.
+// iOS Safari requires camera access to be triggered by a user gesture.
+window.addEventListener('load', () => {
+  const savedApi = localStorage.getItem('api');
+  const savedPin = localStorage.getItem('pin');
+  if (savedApi) document.getElementById('apiUrl').value = savedApi;
+  if (savedPin) document.getElementById('pin').value = savedPin;
+  document.getElementById('name').value = localStorage.getItem('name') || '';
+  if (savedApi && savedPin) {
+    document.querySelector('#gate button').textContent = 'Resume scanning';
+  }
+});
+
+// Refresh stats every 30s
+setInterval(() => { if (api && pin) refreshStats(); }, 30000);
+</script>
+</body>
+</html>
