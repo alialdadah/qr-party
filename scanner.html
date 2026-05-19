@@ -77,7 +77,6 @@ let qrScanner = null;
 let audioCtx = null;
 
 function beep(frequency, duration, type = 'sine') {
-  // Web Audio works on iOS but must be initialized after a user gesture.
   if (!audioCtx) {
     const Ctx = window.AudioContext || window.webkitAudioContext;
     if (!Ctx) return;
@@ -95,7 +94,6 @@ function beep(frequency, duration, type = 'sine') {
 }
 
 function feedback(kind) {
-  // Audio works everywhere; vibration is a bonus on Android.
   if (kind === 'ok') {
     beep(880, 0.15);
     if (navigator.vibrate) navigator.vibrate([100, 50, 100]);
@@ -150,7 +148,6 @@ function startScanner() {
 
 async function onScan(decodedText) {
   const now = Date.now();
-  // Debounce: ignore same code within 3s, or any code within 1s
   if (decodedText === lastPayload && now - lastScan < 3000) return;
   if (now - lastScan < 1000) return;
   lastScan = now;
@@ -233,8 +230,6 @@ function escapeHtml(s) {
   }[c]));
 }
 
-// Pre-fill saved credentials but DO NOT auto-start.
-// iOS Safari requires camera access to be triggered by a user gesture.
 window.addEventListener('load', () => {
   const savedApi = localStorage.getItem('api');
   const savedPin = localStorage.getItem('pin');
@@ -246,7 +241,6 @@ window.addEventListener('load', () => {
   }
 });
 
-// Refresh stats every 30s
 setInterval(() => { if (api && pin) refreshStats(); }, 30000);
 </script>
 </body>
