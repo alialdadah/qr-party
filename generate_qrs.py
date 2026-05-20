@@ -5,12 +5,15 @@ Usage:
     export HMAC_SECRET=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')
     python generate_qrs.py guests.csv qrs/
 
-Input CSV must have a 'name' column. An 'id' column is optional;
-if missing, a random ID is generated per guest.
+Input CSV columns:
+    name        (required) display name for the invite (e.g. "Hassan Family" or "John & Mary")
+    id          (optional) stable invite ID — auto-generated if missing
+    party_size  (optional) how many people this invite admits — default 1
+    table       (optional) table label (number, name, anything) — blank means no table shown
 
 Output:
-    qrs/<name>_<id>.png          one QR code per guest
-    qrs/_seed.csv                guest list for backend seeding
+    qrs/<name>_<id>.png   one QR per invite (the whole family shares one code)
+    qrs/_seed.csv         guest list for backend seeding
 """
 import csv
 import hmac
@@ -33,6 +36,19 @@ def sign(guest_id: str) -> str:
     return base64.urlsafe_b64encode(digest[:12]).decode().rstrip("=")
 
 
+def parse_party_size(raw: str) -> int:
+    raw = (raw or "").strip()
+    if not raw:
+        return 1
+    try:
+        n = int(raw)
+    except ValueError:
+        raise ValueError(f"party_size must be an integer, got {raw!r}")
+    if n < 1:
+        raise ValueError(f"party_size must be >= 1, got {n}")
+    return n
+
+
 def main(csv_path: str, output_dir: str) -> None:
     if not SECRET:
         print("ERROR: HMAC_SECRET env var not set.")
@@ -51,7 +67,11 @@ def main(csv_path: str, output_dir: str) -> None:
 
     seed_rows = []
     for guest in guests:
-        gid = guest.get("id") or secrets.token_urlsafe(8)
+        gid = (guest.get("id") or "").strip() or secrets.token_urlsafe(8)
+        name = guest["name"].strip()
+        party_size = parse_party_size(guest.get("party_size", ""))
+        table = (guest.get("table") or "").strip()
+
         sig = sign(gid)
         payload = f"{gid}|{sig}"
 
@@ -60,20 +80,27 @@ def main(csv_path: str, output_dir: str) -> None:
         qr.make(fit=True)
         img = qr.make_image(fill_color="black", back_color="white")
 
-        safe_name = "".join(c if c.isalnum() else "_" for c in guest["name"])
+        safe_name = "".join(c if c.isalnum() else "_" for c in name)
         filename = f"{safe_name}_{gid}.png"
         img.save(out / filename)
 
-        seed_rows.append({"id": gid, "name": guest["name"]})
-        print(f"  {guest['name']:<30} -> {filename}")
+        seed_rows.append({
+            "id": gid,
+            "name": name,
+            "party_size": party_size,
+            "table": table,
+        })
+        suffix = f"  (party of {party_size})" if party_size > 1 else ""
+        print(f"  {name:<30} -> {filename}{suffix}")
 
     seed_path = out / "_seed.csv"
     with open(seed_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["id", "name"])
+        writer = csv.DictWriter(f, fieldnames=["id", "name", "party_size", "table"])
         writer.writeheader()
         writer.writerows(seed_rows)
 
-    print(f"\nDone. {len(guests)} codes written to {out}/")
+    total_people = sum(r["party_size"] for r in seed_rows)
+    print(f"\nDone. {len(guests)} QR codes for {total_people} people written to {out}/")
     print(f"Seed file for backend: {seed_path}")
 
 

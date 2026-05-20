@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Local secrets and generated artifacts
+.env
+party.db
+qrs/
+guests-export.csv

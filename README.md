@@ -15,27 +15,47 @@ One QR per **invitation**, not per person — a family of four shares one QR, th
 
 ### 1. Set up locally
 
-```bash
-pip install -r requirements.txt
+Create a virtualenv and install deps:
 
+```bash
+python -m venv .venv
+source .venv/bin/activate            # macOS/Linux
+# .\.venv\Scripts\Activate.ps1       # Windows PowerShell
+pip install -r requirements.txt
+```
+
+Set the shared secret and staff PIN. **Same `HMAC_SECRET` must be used by `generate_qrs.py` and the backend** — if they differ, every scan returns "Forged or tampered QR".
+
+```bash
+# macOS/Linux
 export HMAC_SECRET=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')
-export STAFF_PIN=4729   # whatever you want
-echo "HMAC_SECRET=$HMAC_SECRET"   # save this somewhere safe
+export STAFF_PIN=4729
+echo "$HMAC_SECRET"   # save this somewhere safe (1Password, sticky note, whatever)
+```
+
+```powershell
+# Windows PowerShell
+$env:HMAC_SECRET = python -c "import secrets; print(secrets.token_urlsafe(32))"
+$env:STAFF_PIN = "4729"
+$env:HMAC_SECRET   # save this somewhere safe
 ```
 
 ### 2. Prepare your guest list
 
-Create `guests.csv` with at minimum a `name` column. Optionally add `party_size` (how many people that invite admits, default 1) and `table` (any string — number, name, whatever you write on the seating chart):
+Create `guests.csv` with at minimum a `name` column. Optional columns:
+- `id` — stable invite ID; auto-generated if omitted
+- `party_size` — how many people the invite admits (default 1)
+- `table` — any string (number, name, whatever you write on the seating chart); blank means no table shown
 
 ```csv
 name,party_size,table
 Sarah Ahmed,1,3
 Hassan Family,4,7
-John Smith,2,
+John & Mary Smith,2,3
 Layla Hassan,1,Head
 ```
 
-Leaving `table` blank just means no table is shown on the scanner for that guest.
+A sample `guests.csv` is included — feel free to overwrite it.
 
 ### 3. Generate QR codes
 
@@ -43,7 +63,7 @@ Leaving `table` blank just means no table is shown on the scanner for that guest
 python generate_qrs.py guests.csv qrs/
 ```
 
-You get one PNG per guest in `qrs/` plus `qrs/_seed.csv` for the backend. Email or print the PNGs.
+You get one PNG per **invite** in `qrs/` (so the Hassan Family of 4 gets one QR, not four) plus `qrs/_seed.csv` for the backend. Email or print the PNGs.
 
 ### 4. Deploy backend
 
@@ -67,6 +87,8 @@ After it deploys, seed the guest table:
 ```bash
 curl -X POST https://your-app.onrender.com/seed -H "X-Staff-Pin: 4729"
 ```
+
+`/seed` is an **upsert** — safe to re-run after adding new guests to `seed.csv`. It inserts new rows and updates names / party sizes / tables on existing ones (but it won't lower `party_size` below the number already admitted).
 
 ## Day 2: Scanner page and dry run
 
@@ -97,8 +119,8 @@ Drop `scanner.html` on Vercel, Netlify, or even GitHub Pages. The camera API onl
 
 ## Useful endpoints during the party
 
-- `GET /stats` shows live arrival count
-- `GET /log` shows recent scans (most recent first)
+- `GET /stats` shows live arrival count (in people, not invites — also includes `invites_total` / `invites_scanned`)
+- `GET /log` shows recent scans (most recent first), including party size and how many were admitted
 
 Both need the `X-Staff-Pin` header.
 

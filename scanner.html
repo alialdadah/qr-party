@@ -39,8 +39,10 @@
   .ok { background: #16a34a; }
   .duplicate { background: #ca8a04; }
   .invalid { background: #dc2626; }
+  .confirm { background: #2563eb; }
   .icon { font-size: 40px; margin-bottom: 8px; }
   .name { font-size: 26px; font-weight: 700; margin: 8px 0; }
+  .table { font-size: 18px; font-weight: 600; margin: 6px 0; opacity: 0.95; }
   .reason { font-size: 14px; opacity: 0.9; margin-top: 4px; }
   .stats {
     font-size: 13px; opacity: 0.6; text-align: center;
@@ -48,6 +50,24 @@
   }
   .gate { padding-top: 60px; }
   .hint { font-size: 12px; opacity: 0.5; margin-top: -6px; margin-bottom: 12px; }
+  .stepper {
+    display: flex; align-items: center; justify-content: center; gap: 16px;
+    margin: 16px 0;
+  }
+  .stepper button {
+    width: 56px; height: 56px; padding: 0; margin: 0;
+    font-size: 28px; font-weight: 700; border-radius: 50%;
+    background: rgba(255,255,255,0.18);
+  }
+  .stepper button:disabled { opacity: 0.3; cursor: not-allowed; }
+  .stepper .count {
+    font-size: 36px; font-weight: 800; min-width: 60px;
+  }
+  .actions { display: flex; gap: 10px; margin-top: 12px; }
+  .actions button { margin: 0; }
+  .admit-btn { background: #fff; color: #1e40af; }
+  .admit-btn:hover { background: #f3f4f6; }
+  .meta { font-size: 13px; opacity: 0.85; margin-top: 6px; }
 </style>
 </head>
 <body>
@@ -75,6 +95,7 @@ let lastScan = 0;
 let lastPayload = '';
 let qrScanner = null;
 let audioCtx = null;
+let awaitingConfirm = false;  // pause scan handling while family card is open
 
 function beep(frequency, duration, type = 'sine') {
   if (!audioCtx) {
@@ -101,6 +122,9 @@ function feedback(kind) {
     beep(440, 0.2);
     setTimeout(() => beep(440, 0.2), 220);
     if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
+  } else if (kind === 'confirm') {
+    beep(660, 0.12);
+    if (navigator.vibrate) navigator.vibrate([60]);
   } else {
     beep(200, 0.4, 'sawtooth');
     if (navigator.vibrate) navigator.vibrate([300]);
@@ -146,7 +170,22 @@ function startScanner() {
   });
 }
 
+async function callVerify(payload, admitCount /* number | null */) {
+  const body = { payload, scanner_name: scannerName };
+  if (admitCount !== null) body.admit_count = admitCount;
+  const res = await fetch(`${api}/verify`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Staff-Pin': pin },
+    body: JSON.stringify(body),
+  });
+  if (res.status === 401) {
+    return { status: 'invalid', reason: 'Staff PIN rejected' };
+  }
+  return res.json();
+}
+
 async function onScan(decodedText) {
+  if (awaitingConfirm) return;  // user is mid-decision on a family
   const now = Date.now();
   if (decodedText === lastPayload && now - lastScan < 3000) return;
   if (now - lastScan < 1000) return;
@@ -154,26 +193,64 @@ async function onScan(decodedText) {
   lastPayload = decodedText;
 
   try {
-    const res = await fetch(`${api}/verify`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Staff-Pin': pin,
-      },
-      body: JSON.stringify({ payload: decodedText, scanner_name: scannerName }),
-    });
-
-    if (res.status === 401) {
-      showResult({ status: 'invalid', reason: 'Staff PIN rejected' });
-      return;
+    const data = await callVerify(decodedText, null);
+    if (data.status === 'confirm') {
+      showConfirm(decodedText, data);
+    } else {
+      showResult(data);
+      refreshStats();
     }
-
-    const data = await res.json();
-    showResult(data);
-    refreshStats();
   } catch (e) {
     showResult({ status: 'invalid', reason: 'Network error: ' + e.message });
   }
+}
+
+function showConfirm(payload, data) {
+  awaitingConfirm = true;
+  feedback('confirm');
+  const remaining = data.remaining;
+  const already = data.admitted_count;
+  const total = data.party_size;
+  let count = remaining;  // default to admitting everyone left
+
+  const el = document.getElementById('result');
+  const render = () => {
+    el.innerHTML = `
+      <div class="result confirm">
+        <div class="icon">👥</div>
+        <div class="name">${escapeHtml(data.name)}</div>
+        ${data.table ? `<div class="table">Table ${escapeHtml(data.table)}</div>` : ''}
+        <div class="meta">Party of ${total}${already ? ` · ${already} already in` : ''}</div>
+        <div class="stepper">
+          <button id="dec" ${count <= 1 ? 'disabled' : ''}>−</button>
+          <div class="count">${count}</div>
+          <button id="inc" ${count >= remaining ? 'disabled' : ''}>+</button>
+        </div>
+        <div class="meta">Admitting ${count} of ${remaining} remaining</div>
+        <div class="actions">
+          <button class="secondary" id="cancel">Cancel</button>
+          <button class="admit-btn" id="admit">Admit ${count}</button>
+        </div>
+      </div>`;
+    document.getElementById('dec').onclick = () => { if (count > 1) { count--; render(); } };
+    document.getElementById('inc').onclick = () => { if (count < remaining) { count++; render(); } };
+    document.getElementById('cancel').onclick = () => {
+      awaitingConfirm = false;
+      el.innerHTML = '';
+      lastPayload = '';  // allow rescanning the same QR
+    };
+    document.getElementById('admit').onclick = async () => {
+      awaitingConfirm = false;
+      try {
+        const result = await callVerify(payload, count);
+        showResult(result);
+        refreshStats();
+      } catch (e) {
+        showResult({ status: 'invalid', reason: 'Network error: ' + e.message });
+      }
+    };
+  };
+  render();
 }
 
 function showResult(data) {
@@ -181,21 +258,27 @@ function showResult(data) {
   let html = '';
 
   if (data.status === 'ok') {
+    const admitted = data.admitted_now || 1;
+    const headline = admitted > 1 ? `Welcome, party of ${admitted}` : 'Welcome';
     html = `
       <div class="result ok">
         <div class="icon">✓</div>
-        <div>Welcome</div>
+        <div>${headline}</div>
         <div class="name">${escapeHtml(data.name)}</div>
+        ${data.table ? `<div class="table">Table ${escapeHtml(data.table)}</div>` : ''}
+        ${data.party_size > 1 && data.remaining > 0
+          ? `<div class="meta">${data.remaining} more from this invite still to arrive</div>` : ''}
       </div>`;
     feedback('ok');
   } else if (data.status === 'duplicate') {
-    const t = new Date(data.scanned_at).toLocaleTimeString();
+    const t = data.scanned_at ? new Date(data.scanned_at).toLocaleTimeString() : '';
     html = `
       <div class="result duplicate">
         <div class="icon">⚠</div>
-        <div>Already scanned</div>
+        <div>${data.admitted_count} of ${data.party_size} already admitted</div>
         <div class="name">${escapeHtml(data.name)}</div>
-        <div class="reason">at ${t} by ${escapeHtml(data.scanned_by || 'unknown')}</div>
+        ${data.table ? `<div class="table">Table ${escapeHtml(data.table)}</div>` : ''}
+        ${t ? `<div class="reason">first scanned at ${t} by ${escapeHtml(data.scanned_by || 'unknown')}</div>` : ''}
       </div>`;
     feedback('duplicate');
   } else {
@@ -233,7 +316,9 @@ function escapeHtml(s) {
 window.addEventListener('load', () => {
   const savedApi = localStorage.getItem('api');
   const savedPin = localStorage.getItem('pin');
-  if (savedApi) document.getElementById('apiUrl').value = savedApi;
+  // Default API URL to the page's own origin (works when scanner.html is
+  // served by main.py — i.e. one tunnel URL handles both).
+  document.getElementById('apiUrl').value = savedApi || window.location.origin;
   if (savedPin) document.getElementById('pin').value = savedPin;
   document.getElementById('name').value = localStorage.getItem('name') || '';
   if (savedApi && savedPin) {
