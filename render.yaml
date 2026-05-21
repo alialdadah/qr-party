@@ -9,6 +9,8 @@ services:
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /healthz
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
       - key: HMAC_SECRET
         sync: false        # set manually in the dashboard (same value as your local .env)
       - key: STAFF_PIN
