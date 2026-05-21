@@ -125,7 +125,8 @@
   <input id="apiUrl" placeholder="API URL (https://...)">
   <div class="hint">Your deployed backend URL, no trailing slash</div>
   <input id="pin" type="password" placeholder="Staff or admin PIN" inputmode="numeric">
-  <input id="name" placeholder="Your name (for the log)">
+  <input id="name" placeholder="Your name (required)">
+  <div class="hint">Used on every scan + audit log entry</div>
   <button onclick="enter()">Continue</button>
 </div>
 
@@ -155,9 +156,17 @@
   </div>
 
   <div id="pane-log" style="display:none;">
-    <input id="logSearch" placeholder="Filter by staff name..." oninput="renderLog()">
-    <div class="meta" style="margin-bottom:8px;">Most recent first · first-admit time per guest</div>
+    <input id="logSearch" placeholder="Filter by actor name..." oninput="renderLog()">
+    <div id="actionChips" class="chips">
+      <button class="active" data-action="all">All</button>
+      <button data-action="admit">Admits</button>
+      <button data-action="update">Edits</button>
+      <button data-action="create">Adds</button>
+      <button data-action="delete">Deletes</button>
+    </div>
+    <div class="meta" style="margin-bottom:8px;">Most recent first · every action, every actor</div>
     <div id="logList" class="list"></div>
+    <button class="secondary" style="margin-top:10px;" onclick="loadLog()">Refresh</button>
   </div>
 
   <div id="pane-add" style="display:none;">
@@ -192,6 +201,15 @@ let awaitingConfirm = false;  // pause scan handling while family card is open
 let currentTab = 'scan';
 let allGuests = [];
 let currentFilter = 'all';
+let allAudit = [];
+let currentActionFilter = 'all';
+
+function apiHeaders(extra) {
+  return Object.assign(
+    { 'X-Staff-Pin': pin, 'X-Actor-Name': scannerName },
+    extra || {},
+  );
+}
 
 function beep(frequency, duration, type = 'sine') {
   if (!audioCtx) {
@@ -230,16 +248,16 @@ function feedback(kind) {
 async function enter() {
   api = document.getElementById('apiUrl').value.trim().replace(/\/$/, '');
   pin = document.getElementById('pin').value.trim();
-  scannerName = document.getElementById('name').value.trim() || 'door';
+  scannerName = document.getElementById('name').value.trim();
 
-  if (!api || !pin) {
-    alert('Fill in API URL and PIN.');
+  if (!api || !pin || !scannerName) {
+    alert('Fill in API URL, PIN, and your name.');
     return;
   }
 
   // Verify PIN and detect role.
   try {
-    const res = await fetch(`${api}/whoami`, { headers: { 'X-Staff-Pin': pin }});
+    const res = await fetch(`${api}/whoami`, { headers: apiHeaders()});
     if (!res.ok) {
       alert('PIN rejected.');
       return;
@@ -287,44 +305,90 @@ function switchTab(tab) {
   if (tab === 'log') loadLog();
 }
 
-let allLogs = [];
-
 async function loadLog() {
   try {
-    const res = await fetch(`${api}/log?limit=200`, { headers: { 'X-Staff-Pin': pin }});
+    const res = await fetch(`${api}/audit?limit=300`, { headers: apiHeaders()});
     if (!res.ok) {
       document.getElementById('logList').innerHTML = `<div class="empty">Could not load (${res.status})</div>`;
       return;
     }
-    allLogs = await res.json();
+    allAudit = await res.json();
     renderLog();
   } catch (e) {
     document.getElementById('logList').innerHTML = `<div class="empty">Network error</div>`;
   }
 }
 
+document.addEventListener('click', (e) => {
+  const btn = e.target.closest('#actionChips button');
+  if (!btn) return;
+  currentActionFilter = btn.dataset.action;
+  document.querySelectorAll('#actionChips button').forEach(b => b.classList.toggle('active', b === btn));
+  renderLog();
+});
+
+const ACTION_VERB = {
+  admit:  { label: 'Admitted',  color: '#16a34a' },
+  create: { label: 'Added',     color: '#2563eb' },
+  update: { label: 'Edited',    color: '#ca8a04' },
+  delete: { label: 'Deleted',   color: '#dc2626' },
+};
+
+function summarizeAudit(r) {
+  const d = r.details || {};
+  if (r.action === 'admit') {
+    const via = d.via === 'manual' ? ' (manual override)' : '';
+    return `${d.count || 1} ${d.count === 1 ? 'person' : 'people'}${via}`;
+  }
+  if (r.action === 'create') {
+    const t = d.table ? `, table ${d.table}` : '';
+    return `party of ${d.party_size}${t}`;
+  }
+  if (r.action === 'delete') {
+    return `was party of ${d.party_size}, ${d.admitted_count} admitted`;
+  }
+  if (r.action === 'update') {
+    const ch = d.changes || {};
+    return Object.keys(ch).map(k => {
+      const c = ch[k];
+      return `${k}: ${formatVal(c.from)} → ${formatVal(c.to)}`;
+    }).join(' · ');
+  }
+  return '';
+}
+
+function formatVal(v) {
+  if (v === null || v === undefined || v === '') return '∅';
+  return String(v);
+}
+
 function renderLog() {
   const q = (document.getElementById('logSearch').value || '').toLowerCase().trim();
   const list = document.getElementById('logList');
 
-  const filtered = allLogs.filter(r => !q || (r.scanned_by || '').toLowerCase().includes(q));
+  const filtered = allAudit
+    .filter(r => currentActionFilter === 'all' || r.action === currentActionFilter)
+    .filter(r => !q || (r.actor || '').toLowerCase().includes(q) || (r.guest_name || '').toLowerCase().includes(q));
 
   if (filtered.length === 0) {
-    list.innerHTML = `<div class="empty">No scans yet</div>`;
+    list.innerHTML = `<div class="empty">No matching events</div>`;
     return;
   }
 
   list.innerHTML = filtered.map(r => {
-    const t = new Date(r.scanned_at);
+    const t = new Date(r.ts);
     const time = t.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     const date = t.toLocaleDateString([], { month: 'short', day: 'numeric' });
-    const tableStr = r.table ? ` · table ${escapeHtml(r.table)}` : '';
-    const partyStr = r.party_size > 1 ? ` · ${r.admitted_count}/${r.party_size}` : '';
+    const verb = ACTION_VERB[r.action] || { label: r.action, color: '#888' };
+    const summary = summarizeAudit(r);
     return `
       <div class="row" style="cursor:default;">
         <div class="left">
-          <div class="name-row">${escapeHtml(r.name)}${partyStr}</div>
-          <div class="sub">${date} ${time}${tableStr} · by ${escapeHtml(r.scanned_by || 'unknown')}</div>
+          <div class="name-row">
+            <span style="color:${verb.color};">${verb.label}</span>
+            ${r.guest_name ? ` · ${escapeHtml(r.guest_name)}` : ''}
+          </div>
+          <div class="sub">${date} ${time} · by ${escapeHtml(r.actor)}${summary ? ` · ${escapeHtml(summary)}` : ''}</div>
         </div>
       </div>`;
   }).join('');
@@ -338,7 +402,7 @@ function logout() {
 
 async function loadGuests() {
   try {
-    const res = await fetch(`${api}/guests`, { headers: { 'X-Staff-Pin': pin }});
+    const res = await fetch(`${api}/guests`, { headers: apiHeaders()});
     if (!res.ok) {
       document.getElementById('guestList').innerHTML = `<div class="empty">Could not load (${res.status})</div>`;
       return;
@@ -459,7 +523,7 @@ async function saveGuest(id) {
   try {
     const res = await fetch(`${api}/guests/${encodeURIComponent(id)}`, {
       method: 'PATCH',
-      headers: { 'Content-Type': 'application/json', 'X-Staff-Pin': pin },
+      headers: apiHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(body),
     });
     if (!res.ok) {
@@ -479,7 +543,7 @@ async function manualAdmit(id, count) {
   try {
     const res = await fetch(`${api}/guests/${encodeURIComponent(id)}/admit`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Staff-Pin': pin },
+      headers: apiHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ count, scanner_name: scannerName }),
     });
     if (!res.ok) {
@@ -501,7 +565,7 @@ async function deleteGuest(id, name) {
   try {
     const res = await fetch(`${api}/guests/${encodeURIComponent(id)}`, {
       method: 'DELETE',
-      headers: { 'X-Staff-Pin': pin },
+      headers: apiHeaders(),
     });
     if (!res.ok) {
       alert('Delete failed: ' + res.status);
@@ -520,7 +584,7 @@ async function showQr(id) {
   container.innerHTML = `<div class="meta" style="text-align:center;">Loading QR...</div>`;
   try {
     const res = await fetch(`${api}/guests/${encodeURIComponent(id)}/qr`, {
-      headers: { 'X-Staff-Pin': pin },
+      headers: apiHeaders(),
     });
     if (!res.ok) {
       container.innerHTML = `<div class="meta" style="text-align:center;">QR failed (${res.status})</div>`;
@@ -544,7 +608,7 @@ async function showQr(id) {
 async function shareQr(id, btn) {
   try {
     const res = await fetch(`${api}/guests/${encodeURIComponent(id)}/qr`, {
-      headers: { 'X-Staff-Pin': pin },
+      headers: apiHeaders(),
     });
     const blob = await res.blob();
     const file = new File([blob], `${id}.png`, { type: 'image/png' });
@@ -567,7 +631,7 @@ async function submitAdd() {
   try {
     const res = await fetch(`${api}/guests`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Staff-Pin': pin },
+      headers: apiHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ name, party_size: party, table }),
     });
     if (!res.ok) {
@@ -592,7 +656,7 @@ async function submitAdd() {
       </div>`;
 
     const qrRes = await fetch(`${api}/guests/${encodeURIComponent(id)}/qr`, {
-      headers: { 'X-Staff-Pin': pin },
+      headers: apiHeaders(),
     });
     const blob = await qrRes.blob();
     const url = URL.createObjectURL(blob);
@@ -626,7 +690,7 @@ async function callVerify(payload, admitCount /* number | null */) {
   if (admitCount !== null) body.admit_count = admitCount;
   const res = await fetch(`${api}/verify`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Staff-Pin': pin },
+    headers: apiHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify(body),
   });
   if (res.status === 401) {
@@ -750,7 +814,7 @@ function showResult(data) {
 
 async function refreshStats() {
   try {
-    const res = await fetch(`${api}/stats`, { headers: { 'X-Staff-Pin': pin }});
+    const res = await fetch(`${api}/stats`, { headers: apiHeaders()});
     if (!res.ok) return;
     const data = await res.json();
     document.getElementById('stats').textContent =

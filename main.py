@@ -15,6 +15,7 @@ Endpoints:
 import os
 import csv
 import io
+import json
 import hmac
 import hashlib
 import base64
@@ -59,7 +60,32 @@ class Guest(Base):
     scanned_by = Column(String, nullable=True)     # staff name on first admit
 
 
+class AuditLog(Base):
+    __tablename__ = "audit_log"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ts = Column(DateTime, nullable=False)
+    actor = Column(String, nullable=False)
+    actor_role = Column(String, nullable=False)    # "staff" | "admin"
+    action = Column(String, nullable=False)        # "admit" | "create" | "update" | "delete"
+    guest_id = Column(String, nullable=True)
+    guest_name = Column(String, nullable=True)
+    details = Column(String, nullable=True)        # JSON
+
+
 Base.metadata.create_all(engine)
+
+
+def audit(db: Session, actor: str, role: str, action: str,
+          guest: Guest | None, details: dict | None = None) -> None:
+    db.add(AuditLog(
+        ts=datetime.now(timezone.utc),
+        actor=(actor or "unknown").strip() or "unknown",
+        actor_role=role,
+        action=action,
+        guest_id=guest.id if guest else None,
+        guest_name=guest.name if guest else None,
+        details=json.dumps(details) if details else None,
+    ))
 
 
 def migrate_legacy_schema() -> None:
@@ -164,8 +190,8 @@ def _guest_payload(guest: Guest, status: str, extra: dict | None = None) -> dict
     return body
 
 
-@app.post("/verify", dependencies=[Depends(verify_pin)])
-def verify(req: VerifyRequest, db: Session = Depends(get_db)):
+@app.post("/verify")
+def verify(req: VerifyRequest, db: Session = Depends(get_db), role: str = Depends(verify_pin)):
     try:
         guest_id, sig = req.payload.split("|", 1)
     except ValueError:
@@ -191,6 +217,7 @@ def verify(req: VerifyRequest, db: Session = Depends(get_db)):
             if not guest.scanned_at:
                 guest.scanned_at = datetime.now(timezone.utc)
                 guest.scanned_by = req.scanner_name
+            audit(db, req.scanner_name, role, "admit", guest, {"count": 1, "via": "scan"})
             db.commit()
             return _guest_payload(guest, "ok", {"admitted_now": 1})
         # Family — return a "confirm" status so the scanner shows the stepper.
@@ -211,6 +238,7 @@ def verify(req: VerifyRequest, db: Session = Depends(get_db)):
     if not guest.scanned_at:
         guest.scanned_at = datetime.now(timezone.utc)
         guest.scanned_by = req.scanner_name
+    audit(db, req.scanner_name, role, "admit", guest, {"count": req.admit_count, "via": "scan"})
     db.commit()
     return _guest_payload(guest, "ok", {"admitted_now": req.admit_count})
 
@@ -439,13 +467,18 @@ class ManualAdmitRequest(BaseModel):
     scanner_name: str = "admin"
 
 
+def get_actor(x_actor_name: str = Header(default="")) -> str:
+    return (x_actor_name or "").strip() or "admin"
+
+
 @app.get("/whoami")
 def whoami(role: str = Depends(verify_pin)):
     return {"role": role}
 
 
 @app.post("/guests", dependencies=[Depends(verify_admin)])
-def create_guest(req: CreateGuestRequest, db: Session = Depends(get_db)):
+def create_guest(req: CreateGuestRequest, db: Session = Depends(get_db),
+                 actor: str = Depends(get_actor)):
     name = req.name.strip()
     if not name:
         raise HTTPException(400, "name is required")
@@ -463,15 +496,26 @@ def create_guest(req: CreateGuestRequest, db: Session = Depends(get_db)):
         table_number=table,
     )
     db.add(guest)
+    audit(db, actor, "admin", "create", guest,
+          {"party_size": req.party_size, "table": table})
     db.commit()
     return _guest_payload(guest, "ok", {"id": gid})
 
 
 @app.patch("/guests/{guest_id}", dependencies=[Depends(verify_admin)])
-def update_guest(guest_id: str, req: UpdateGuestRequest, db: Session = Depends(get_db)):
+def update_guest(guest_id: str, req: UpdateGuestRequest, db: Session = Depends(get_db),
+                 actor: str = Depends(get_actor)):
     guest = db.query(Guest).filter(Guest.id == guest_id).first()
     if not guest:
         raise HTTPException(404, "guest not found")
+
+    # Snapshot for diff.
+    before = {
+        "name": guest.name,
+        "party_size": guest.party_size,
+        "table": guest.table_number,
+        "admitted_count": guest.admitted_count,
+    }
 
     if req.name is not None:
         new_name = req.name.strip()
@@ -496,15 +540,27 @@ def update_guest(guest_id: str, req: UpdateGuestRequest, db: Session = Depends(g
     if guest.party_size < guest.admitted_count:
         guest.party_size = guest.admitted_count
 
+    after = {
+        "name": guest.name,
+        "party_size": guest.party_size,
+        "table": guest.table_number,
+        "admitted_count": guest.admitted_count,
+    }
+    changes = {k: {"from": before[k], "to": after[k]} for k in before if before[k] != after[k]}
+    if changes:
+        audit(db, actor, "admin", "update", guest, {"changes": changes})
     db.commit()
     return _guest_payload(guest, "ok", {"id": guest.id})
 
 
 @app.delete("/guests/{guest_id}", dependencies=[Depends(verify_admin)])
-def delete_guest(guest_id: str, db: Session = Depends(get_db)):
+def delete_guest(guest_id: str, db: Session = Depends(get_db),
+                 actor: str = Depends(get_actor)):
     guest = db.query(Guest).filter(Guest.id == guest_id).first()
     if not guest:
         raise HTTPException(404, "guest not found")
+    audit(db, actor, "admin", "delete", guest,
+          {"party_size": guest.party_size, "admitted_count": guest.admitted_count})
     db.delete(guest)
     db.commit()
     return {"status": "ok", "id": guest_id}
@@ -528,8 +584,33 @@ def manual_admit(guest_id: str, req: ManualAdmitRequest, db: Session = Depends(g
     if not guest.scanned_at:
         guest.scanned_at = datetime.now(timezone.utc)
         guest.scanned_by = req.scanner_name
+    audit(db, req.scanner_name, "admin", "admit", guest, {"count": admit, "via": "manual"})
     db.commit()
     return _guest_payload(guest, "ok", {"admitted_now": admit, "id": guest.id})
+
+
+@app.get("/audit", dependencies=[Depends(verify_admin)])
+def get_audit(limit: int = 200, action: str | None = None, actor: str | None = None,
+              db: Session = Depends(get_db)):
+    q = db.query(AuditLog).order_by(AuditLog.ts.desc())
+    if action:
+        q = q.filter(AuditLog.action == action)
+    if actor:
+        q = q.filter(AuditLog.actor.ilike(f"%{actor}%"))
+    rows = q.limit(min(max(limit, 1), 1000)).all()
+    return [
+        {
+            "id": r.id,
+            "ts": r.ts.replace(tzinfo=timezone.utc).isoformat(),
+            "actor": r.actor,
+            "actor_role": r.actor_role,
+            "action": r.action,
+            "guest_id": r.guest_id,
+            "guest_name": r.guest_name,
+            "details": json.loads(r.details) if r.details else None,
+        }
+        for r in rows
+    ]
 
 
 @app.get("/guests/{guest_id}/qr", dependencies=[Depends(verify_admin)])
