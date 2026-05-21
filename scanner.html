@@ -134,6 +134,7 @@
     <button id="tab-scan" class="active" onclick="switchTab('scan')">Scan</button>
     <button id="tab-guests" class="admin-only" onclick="switchTab('guests')" style="display:none;">Guests</button>
     <button id="tab-add" class="admin-only" onclick="switchTab('add')" style="display:none;">Add</button>
+    <button id="tab-log" class="admin-only" onclick="switchTab('log')" style="display:none;">Log</button>
   </div>
 
   <div id="pane-scan">
@@ -151,6 +152,12 @@
       <button data-filter="complete">Done</button>
     </div>
     <div id="guestList" class="list"></div>
+  </div>
+
+  <div id="pane-log" style="display:none;">
+    <input id="logSearch" placeholder="Filter by staff name..." oninput="renderLog()">
+    <div class="meta" style="margin-bottom:8px;">Most recent first · first-admit time per guest</div>
+    <div id="logList" class="list"></div>
   </div>
 
   <div id="pane-add" style="display:none;">
@@ -271,14 +278,56 @@ function switchTab(tab) {
     qrScanner = null;
   }
 
-  document.getElementById('tab-scan').classList.toggle('active', tab === 'scan');
-  document.getElementById('tab-guests').classList.toggle('active', tab === 'guests');
-  document.getElementById('tab-add').classList.toggle('active', tab === 'add');
-  document.getElementById('pane-scan').style.display = tab === 'scan' ? '' : 'none';
-  document.getElementById('pane-guests').style.display = tab === 'guests' ? '' : 'none';
-  document.getElementById('pane-add').style.display = tab === 'add' ? '' : 'none';
+  ['scan', 'guests', 'add', 'log'].forEach(t => {
+    document.getElementById('tab-' + t).classList.toggle('active', tab === t);
+    document.getElementById('pane-' + t).style.display = tab === t ? '' : 'none';
+  });
 
   if (tab === 'guests') loadGuests();
+  if (tab === 'log') loadLog();
+}
+
+let allLogs = [];
+
+async function loadLog() {
+  try {
+    const res = await fetch(`${api}/log?limit=200`, { headers: { 'X-Staff-Pin': pin }});
+    if (!res.ok) {
+      document.getElementById('logList').innerHTML = `<div class="empty">Could not load (${res.status})</div>`;
+      return;
+    }
+    allLogs = await res.json();
+    renderLog();
+  } catch (e) {
+    document.getElementById('logList').innerHTML = `<div class="empty">Network error</div>`;
+  }
+}
+
+function renderLog() {
+  const q = (document.getElementById('logSearch').value || '').toLowerCase().trim();
+  const list = document.getElementById('logList');
+
+  const filtered = allLogs.filter(r => !q || (r.scanned_by || '').toLowerCase().includes(q));
+
+  if (filtered.length === 0) {
+    list.innerHTML = `<div class="empty">No scans yet</div>`;
+    return;
+  }
+
+  list.innerHTML = filtered.map(r => {
+    const t = new Date(r.scanned_at);
+    const time = t.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const date = t.toLocaleDateString([], { month: 'short', day: 'numeric' });
+    const tableStr = r.table ? ` · table ${escapeHtml(r.table)}` : '';
+    const partyStr = r.party_size > 1 ? ` · ${r.admitted_count}/${r.party_size}` : '';
+    return `
+      <div class="row" style="cursor:default;">
+        <div class="left">
+          <div class="name-row">${escapeHtml(r.name)}${partyStr}</div>
+          <div class="sub">${date} ${time}${tableStr} · by ${escapeHtml(r.scanned_by || 'unknown')}</div>
+        </div>
+      </div>`;
+  }).join('');
 }
 
 function logout() {
