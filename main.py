@@ -18,8 +18,10 @@ import io
 import hmac
 import hashlib
 import base64
+import secrets
 from datetime import datetime, timezone
 
+import qrcode
 from fastapi import FastAPI, HTTPException, Header, Depends, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
@@ -30,6 +32,7 @@ from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
 SECRET = os.environ.get("HMAC_SECRET", "").encode()
 STAFF_PIN = os.environ.get("STAFF_PIN", "")
+ADMIN_PIN = os.environ.get("ADMIN_PIN", "")
 DB_URL = os.environ.get("DATABASE_URL", "sqlite:///./party.db")
 # Render hands out URLs starting with "postgres://"; SQLAlchemy 2.x requires "postgresql://".
 if DB_URL.startswith("postgres://"):
@@ -96,15 +99,42 @@ def get_db():
         db.close()
 
 
-def verify_pin(x_staff_pin: str = Header(default="")):
-    if not hmac.compare_digest(x_staff_pin, STAFF_PIN):
-        raise HTTPException(status_code=401, detail="Invalid staff PIN")
+def verify_pin(x_staff_pin: str = Header(default="")) -> str:
+    """Accept either staff or admin PIN. Returns the role."""
+    if hmac.compare_digest(x_staff_pin, STAFF_PIN):
+        return "staff"
+    if ADMIN_PIN and hmac.compare_digest(x_staff_pin, ADMIN_PIN):
+        return "admin"
+    raise HTTPException(status_code=401, detail="Invalid PIN")
+
+
+def verify_admin(x_staff_pin: str = Header(default="")) -> str:
+    """Admin-only endpoints. ADMIN_PIN must be configured."""
+    if not ADMIN_PIN or not hmac.compare_digest(x_staff_pin, ADMIN_PIN):
+        raise HTTPException(status_code=401, detail="Admin PIN required")
+    return "admin"
 
 
 def verify_signature(guest_id: str, sig: str) -> bool:
     expected_digest = hmac.new(SECRET, guest_id.encode(), hashlib.sha256).digest()
     expected_sig = base64.urlsafe_b64encode(expected_digest[:12]).decode().rstrip("=")
     return hmac.compare_digest(expected_sig, sig)
+
+
+def sign_guest(guest_id: str) -> str:
+    digest = hmac.new(SECRET, guest_id.encode(), hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(digest[:12]).decode().rstrip("=")
+
+
+def qr_png_bytes(guest_id: str) -> bytes:
+    payload = f"{guest_id}|{sign_guest(guest_id)}"
+    qr = qrcode.QRCode(box_size=10, border=4, error_correction=qrcode.constants.ERROR_CORRECT_M)
+    qr.add_data(payload)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 class VerifyRequest(BaseModel):
@@ -239,6 +269,7 @@ def list_guests(status: str | None = None, db: Session = Depends(get_db)):
         if status and s != status:
             continue
         out.append({
+            "id": r.id,
             "name": r.name,
             "table": r.table_number or "",
             "party_size": r.party_size,
@@ -388,6 +419,129 @@ async def import_csv(file: UploadFile = File(...), db: Session = Depends(get_db)
 
     db.commit()
     return {"added": added, "updated": updated, "skipped": skipped, "errors": errors}
+
+
+class CreateGuestRequest(BaseModel):
+    name: str
+    party_size: int = 1
+    table: str | None = None
+
+
+class UpdateGuestRequest(BaseModel):
+    name: str | None = None
+    party_size: int | None = None
+    table: str | None = None
+    admitted_count: int | None = None
+
+
+class ManualAdmitRequest(BaseModel):
+    count: int = 1
+    scanner_name: str = "admin"
+
+
+@app.get("/whoami")
+def whoami(role: str = Depends(verify_pin)):
+    return {"role": role}
+
+
+@app.post("/guests", dependencies=[Depends(verify_admin)])
+def create_guest(req: CreateGuestRequest, db: Session = Depends(get_db)):
+    name = req.name.strip()
+    if not name:
+        raise HTTPException(400, "name is required")
+    if req.party_size < 1:
+        raise HTTPException(400, "party_size must be >= 1")
+    table = (req.table or "").strip() or None
+
+    gid = secrets.token_urlsafe(8)
+    while db.query(Guest).filter(Guest.id == gid).first() is not None:
+        gid = secrets.token_urlsafe(8)
+
+    guest = Guest(
+        id=gid, name=name,
+        party_size=req.party_size, admitted_count=0,
+        table_number=table,
+    )
+    db.add(guest)
+    db.commit()
+    return _guest_payload(guest, "ok", {"id": gid})
+
+
+@app.patch("/guests/{guest_id}", dependencies=[Depends(verify_admin)])
+def update_guest(guest_id: str, req: UpdateGuestRequest, db: Session = Depends(get_db)):
+    guest = db.query(Guest).filter(Guest.id == guest_id).first()
+    if not guest:
+        raise HTTPException(404, "guest not found")
+
+    if req.name is not None:
+        new_name = req.name.strip()
+        if not new_name:
+            raise HTTPException(400, "name cannot be blank")
+        guest.name = new_name
+    if req.party_size is not None:
+        if req.party_size < 1:
+            raise HTTPException(400, "party_size must be >= 1")
+        guest.party_size = req.party_size
+    if req.table is not None:
+        guest.table_number = req.table.strip() or None
+    if req.admitted_count is not None:
+        if req.admitted_count < 0:
+            raise HTTPException(400, "admitted_count must be >= 0")
+        guest.admitted_count = min(req.admitted_count, guest.party_size)
+        if guest.admitted_count == 0:
+            guest.scanned_at = None
+            guest.scanned_by = None
+
+    # Keep party_size >= admitted_count even if admin lowers it.
+    if guest.party_size < guest.admitted_count:
+        guest.party_size = guest.admitted_count
+
+    db.commit()
+    return _guest_payload(guest, "ok", {"id": guest.id})
+
+
+@app.delete("/guests/{guest_id}", dependencies=[Depends(verify_admin)])
+def delete_guest(guest_id: str, db: Session = Depends(get_db)):
+    guest = db.query(Guest).filter(Guest.id == guest_id).first()
+    if not guest:
+        raise HTTPException(404, "guest not found")
+    db.delete(guest)
+    db.commit()
+    return {"status": "ok", "id": guest_id}
+
+
+@app.post("/guests/{guest_id}/admit", dependencies=[Depends(verify_admin)])
+def manual_admit(guest_id: str, req: ManualAdmitRequest, db: Session = Depends(get_db)):
+    """Admin override: admit N people from this invite without scanning a QR."""
+    guest = db.query(Guest).filter(Guest.id == guest_id).first()
+    if not guest:
+        raise HTTPException(404, "guest not found")
+    if req.count < 1:
+        raise HTTPException(400, "count must be >= 1")
+
+    remaining = guest.party_size - guest.admitted_count
+    if remaining <= 0:
+        return _guest_payload(guest, "duplicate")
+    admit = min(req.count, remaining)
+
+    guest.admitted_count += admit
+    if not guest.scanned_at:
+        guest.scanned_at = datetime.now(timezone.utc)
+        guest.scanned_by = req.scanner_name
+    db.commit()
+    return _guest_payload(guest, "ok", {"admitted_now": admit, "id": guest.id})
+
+
+@app.get("/guests/{guest_id}/qr", dependencies=[Depends(verify_admin)])
+def guest_qr(guest_id: str, db: Session = Depends(get_db)):
+    guest = db.query(Guest).filter(Guest.id == guest_id).first()
+    if not guest:
+        raise HTTPException(404, "guest not found")
+    return Response(
+        content=qr_png_bytes(guest_id),
+        media_type="image/png",
+        headers={"Content-Disposition": f'inline; filename="{guest_id}.png"'},
+    )
 
 
 @app.get("/")

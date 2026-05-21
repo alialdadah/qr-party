@@ -68,34 +68,123 @@
   .admit-btn { background: #fff; color: #1e40af; }
   .admit-btn:hover { background: #f3f4f6; }
   .meta { font-size: 13px; opacity: 0.85; margin-top: 6px; }
+
+  .tabs { display: flex; gap: 6px; margin-bottom: 14px; }
+  .tabs button {
+    flex: 1; padding: 10px; margin: 0; font-size: 14px; font-weight: 600;
+    background: #1f1f1f; color: #ccc; border-radius: 10px;
+  }
+  .tabs button.active { background: #6366f1; color: #fff; }
+  .chips { display: flex; gap: 6px; margin: 10px 0 12px; flex-wrap: wrap; }
+  .chips button {
+    width: auto; padding: 6px 12px; margin: 0; font-size: 13px; font-weight: 600;
+    background: #1f1f1f; color: #aaa; border-radius: 999px;
+  }
+  .chips button.active { background: #6366f1; color: #fff; }
+  .list { display: flex; flex-direction: column; gap: 8px; max-height: 60vh; overflow-y: auto; }
+  .row {
+    background: #1a1a1a; padding: 12px 14px; border-radius: 10px;
+    display: flex; justify-content: space-between; align-items: center;
+    cursor: pointer; border: 1px solid #262626;
+  }
+  .row:hover { background: #222; }
+  .row .left { flex: 1; min-width: 0; }
+  .row .name-row { font-weight: 600; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row .sub { font-size: 12px; opacity: 0.6; margin-top: 2px; }
+  .row .badge {
+    font-size: 12px; font-weight: 700; padding: 4px 10px; border-radius: 999px;
+    margin-left: 8px; flex-shrink: 0;
+  }
+  .badge.none { background: #262626; color: #888; }
+  .badge.partial { background: #ca8a04; color: #fff; }
+  .badge.complete { background: #16a34a; color: #fff; }
+  .empty { text-align: center; opacity: 0.5; padding: 40px 0; font-size: 14px; }
+
+  .modal-bg {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.75);
+    display: flex; align-items: flex-end; justify-content: center;
+    z-index: 100;
+  }
+  .modal {
+    background: #161616; width: 100%; max-width: 480px;
+    border-radius: 16px 16px 0 0; padding: 20px; max-height: 90vh; overflow-y: auto;
+  }
+  .modal h2 { margin: 0 0 12px; font-size: 20px; }
+  .modal label { font-size: 12px; opacity: 0.7; display: block; margin-bottom: 4px; margin-top: 8px; }
+  .modal .danger { background: #7f1d1d; }
+  .modal .danger:hover { background: #991b1b; }
+  .qr-img { width: 100%; max-width: 280px; display: block; margin: 12px auto; background: #fff; padding: 10px; border-radius: 8px; }
+  .row-actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+  .row-actions button { flex: 1; min-width: 100px; }
 </style>
 </head>
 <body>
 
 <div id="gate" class="container gate">
-  <h1>Door staff sign-in</h1>
+  <h1>Sign in</h1>
   <input id="apiUrl" placeholder="API URL (https://...)">
   <div class="hint">Your deployed backend URL, no trailing slash</div>
-  <input id="pin" type="password" placeholder="Staff PIN" inputmode="numeric">
+  <input id="pin" type="password" placeholder="Staff or admin PIN" inputmode="numeric">
   <input id="name" placeholder="Your name (for the log)">
-  <button onclick="enter()">Start scanning</button>
+  <button onclick="enter()">Continue</button>
 </div>
 
-<div id="scanner" class="container" style="display:none;">
-  <h1>Scan QR</h1>
-  <div id="reader"></div>
-  <div id="result"></div>
-  <div id="stats" class="stats">Loading...</div>
-  <button class="secondary" onclick="logout()">Sign out</button>
+<div id="app" class="container" style="display:none;">
+  <div id="tabs" class="tabs">
+    <button id="tab-scan" class="active" onclick="switchTab('scan')">Scan</button>
+    <button id="tab-guests" class="admin-only" onclick="switchTab('guests')" style="display:none;">Guests</button>
+    <button id="tab-add" class="admin-only" onclick="switchTab('add')" style="display:none;">Add</button>
+  </div>
+
+  <div id="pane-scan">
+    <div id="reader"></div>
+    <div id="result"></div>
+    <div id="stats" class="stats">Loading...</div>
+  </div>
+
+  <div id="pane-guests" style="display:none;">
+    <input id="search" placeholder="Search by name..." oninput="renderGuests()">
+    <div id="filterChips" class="chips">
+      <button class="active" data-filter="all">All</button>
+      <button data-filter="none">Remaining</button>
+      <button data-filter="partial">Partial</button>
+      <button data-filter="complete">Done</button>
+    </div>
+    <div id="guestList" class="list"></div>
+  </div>
+
+  <div id="pane-add" style="display:none;">
+    <h1>Add guest</h1>
+    <label>Name</label>
+    <input id="addName" placeholder="e.g. Hassan Family">
+    <label>Party size</label>
+    <input id="addParty" type="number" min="1" value="1" inputmode="numeric">
+    <label>Table (optional)</label>
+    <input id="addTable" placeholder="e.g. 5 or Head">
+    <button onclick="submitAdd()">Create guest + QR</button>
+    <div id="addResult"></div>
+  </div>
+
+  <button class="secondary" style="margin-top:14px;" onclick="logout()">Sign out</button>
+</div>
+
+<div id="modal" class="modal-bg" style="display:none;" onclick="if(event.target===this)closeModal()">
+  <div class="modal">
+    <h2 id="modalTitle"></h2>
+    <div id="modalBody"></div>
+  </div>
 </div>
 
 <script>
-let api = '', pin = '', scannerName = '';
+let api = '', pin = '', scannerName = '', role = 'staff';
 let lastScan = 0;
 let lastPayload = '';
 let qrScanner = null;
 let audioCtx = null;
 let awaitingConfirm = false;  // pause scan handling while family card is open
+let currentTab = 'scan';
+let allGuests = [];
+let currentFilter = 'all';
 
 function beep(frequency, duration, type = 'sine') {
   if (!audioCtx) {
@@ -131,7 +220,7 @@ function feedback(kind) {
   }
 }
 
-function enter() {
+async function enter() {
   api = document.getElementById('apiUrl').value.trim().replace(/\/$/, '');
   pin = document.getElementById('pin').value.trim();
   scannerName = document.getElementById('name').value.trim() || 'door';
@@ -141,21 +230,334 @@ function enter() {
     return;
   }
 
+  // Verify PIN and detect role.
+  try {
+    const res = await fetch(`${api}/whoami`, { headers: { 'X-Staff-Pin': pin }});
+    if (!res.ok) {
+      alert('PIN rejected.');
+      return;
+    }
+    const data = await res.json();
+    role = data.role || 'staff';
+  } catch (e) {
+    alert('Could not reach server: ' + e.message);
+    return;
+  }
+
   localStorage.setItem('api', api);
   localStorage.setItem('pin', pin);
   localStorage.setItem('name', scannerName);
 
   document.getElementById('gate').style.display = 'none';
-  document.getElementById('scanner').style.display = 'block';
+  document.getElementById('app').style.display = 'block';
+
+  if (role === 'admin') {
+    document.querySelectorAll('.admin-only').forEach(el => el.style.display = '');
+  }
 
   refreshStats();
   startScanner();
+}
+
+function switchTab(tab) {
+  if (tab === currentTab) return;
+  currentTab = tab;
+
+  // Pause/resume the camera so it isn't running unseen.
+  if (tab === 'scan') {
+    startScanner();
+  } else if (qrScanner) {
+    qrScanner.stop().catch(() => {});
+    qrScanner = null;
+  }
+
+  document.getElementById('tab-scan').classList.toggle('active', tab === 'scan');
+  document.getElementById('tab-guests').classList.toggle('active', tab === 'guests');
+  document.getElementById('tab-add').classList.toggle('active', tab === 'add');
+  document.getElementById('pane-scan').style.display = tab === 'scan' ? '' : 'none';
+  document.getElementById('pane-guests').style.display = tab === 'guests' ? '' : 'none';
+  document.getElementById('pane-add').style.display = tab === 'add' ? '' : 'none';
+
+  if (tab === 'guests') loadGuests();
 }
 
 function logout() {
   if (qrScanner) qrScanner.stop().catch(() => {});
   localStorage.clear();
   location.reload();
+}
+
+async function loadGuests() {
+  try {
+    const res = await fetch(`${api}/guests`, { headers: { 'X-Staff-Pin': pin }});
+    if (!res.ok) {
+      document.getElementById('guestList').innerHTML = `<div class="empty">Could not load (${res.status})</div>`;
+      return;
+    }
+    allGuests = await res.json();
+    renderGuests();
+  } catch (e) {
+    document.getElementById('guestList').innerHTML = `<div class="empty">Network error</div>`;
+  }
+}
+
+document.addEventListener('click', (e) => {
+  const btn = e.target.closest('#filterChips button');
+  if (!btn) return;
+  currentFilter = btn.dataset.filter;
+  document.querySelectorAll('#filterChips button').forEach(b => b.classList.toggle('active', b === btn));
+  renderGuests();
+});
+
+function renderGuests() {
+  const q = (document.getElementById('search').value || '').toLowerCase().trim();
+  const list = document.getElementById('guestList');
+
+  const filtered = allGuests
+    .filter(g => currentFilter === 'all' || g.status === currentFilter)
+    .filter(g => !q || g.name.toLowerCase().includes(q) || (g.table || '').toLowerCase().includes(q))
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  if (filtered.length === 0) {
+    list.innerHTML = `<div class="empty">No guests match</div>`;
+    return;
+  }
+
+  list.innerHTML = filtered.map(g => {
+    const sub = `${g.admitted_count}/${g.party_size} in${g.table ? ` · table ${escapeHtml(g.table)}` : ''}`;
+    return `
+      <div class="row" data-id="${escapeHtml(g.id)}">
+        <div class="left">
+          <div class="name-row">${escapeHtml(g.name)}</div>
+          <div class="sub">${sub}</div>
+        </div>
+        <div class="badge ${g.status}">${g.status === 'none' ? 'Pending' : g.status === 'partial' ? 'Partial' : 'Done'}</div>
+      </div>`;
+  }).join('');
+
+  list.querySelectorAll('.row').forEach(row => {
+    row.onclick = () => openGuestModal(row.dataset.id);
+  });
+}
+
+function openGuestModal(id) {
+  const g = allGuests.find(x => x.id === id);
+  if (!g) return;
+  document.getElementById('modalTitle').textContent = g.name;
+  const remaining = Math.max(g.party_size - g.admitted_count, 0);
+  document.getElementById('modalBody').innerHTML = `
+    <div class="meta">${g.admitted_count} of ${g.party_size} admitted${remaining ? ` · ${remaining} remaining` : ''}</div>
+
+    ${remaining > 0 ? `
+      <label>Quick admit</label>
+      <div class="stepper">
+        <button id="mDec" ${1 <= 1 ? 'disabled' : ''}>−</button>
+        <div class="count" id="mCount">1</div>
+        <button id="mInc" ${remaining <= 1 ? 'disabled' : ''}>+</button>
+      </div>
+      <button class="admit-btn" id="mAdmit">Admit now</button>
+    ` : ''}
+
+    <label>Name</label>
+    <input id="eName" value="${escapeHtml(g.name)}">
+    <label>Party size</label>
+    <input id="eParty" type="number" min="1" value="${g.party_size}" inputmode="numeric">
+    <label>Table</label>
+    <input id="eTable" value="${escapeHtml(g.table || '')}">
+    <label>Admitted count (override)</label>
+    <input id="eAdmitted" type="number" min="0" value="${g.admitted_count}" inputmode="numeric">
+
+    <div class="row-actions">
+      <button onclick="saveGuest('${g.id}')">Save changes</button>
+      <button class="secondary" onclick="showQr('${g.id}')">Show QR</button>
+    </div>
+    <div class="row-actions">
+      <button class="danger" onclick="deleteGuest('${g.id}', '${escapeHtml(g.name).replace(/'/g,"\\'")}')">Delete guest</button>
+      <button class="secondary" onclick="closeModal()">Close</button>
+    </div>
+    <div id="modalQr"></div>
+  `;
+
+  if (remaining > 0) {
+    let c = 1;
+    const cEl = document.getElementById('mCount');
+    const dec = document.getElementById('mDec');
+    const inc = document.getElementById('mInc');
+    const upd = () => {
+      cEl.textContent = c;
+      dec.disabled = c <= 1;
+      inc.disabled = c >= remaining;
+    };
+    dec.onclick = () => { if (c > 1) { c--; upd(); } };
+    inc.onclick = () => { if (c < remaining) { c++; upd(); } };
+    document.getElementById('mAdmit').onclick = () => manualAdmit(g.id, c);
+  }
+
+  document.getElementById('modal').style.display = 'flex';
+}
+
+function closeModal() {
+  document.getElementById('modal').style.display = 'none';
+}
+
+async function saveGuest(id) {
+  const body = {
+    name: document.getElementById('eName').value,
+    party_size: parseInt(document.getElementById('eParty').value, 10),
+    table: document.getElementById('eTable').value,
+    admitted_count: parseInt(document.getElementById('eAdmitted').value, 10),
+  };
+  try {
+    const res = await fetch(`${api}/guests/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', 'X-Staff-Pin': pin },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      alert('Save failed: ' + (err.detail || res.status));
+      return;
+    }
+    closeModal();
+    await loadGuests();
+    refreshStats();
+  } catch (e) {
+    alert('Network error: ' + e.message);
+  }
+}
+
+async function manualAdmit(id, count) {
+  try {
+    const res = await fetch(`${api}/guests/${encodeURIComponent(id)}/admit`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Staff-Pin': pin },
+      body: JSON.stringify({ count, scanner_name: scannerName }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      alert('Admit failed: ' + (err.detail || res.status));
+      return;
+    }
+    feedback('ok');
+    closeModal();
+    await loadGuests();
+    refreshStats();
+  } catch (e) {
+    alert('Network error: ' + e.message);
+  }
+}
+
+async function deleteGuest(id, name) {
+  if (!confirm(`Delete ${name}? Their QR will stop working.`)) return;
+  try {
+    const res = await fetch(`${api}/guests/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+      headers: { 'X-Staff-Pin': pin },
+    });
+    if (!res.ok) {
+      alert('Delete failed: ' + res.status);
+      return;
+    }
+    closeModal();
+    await loadGuests();
+    refreshStats();
+  } catch (e) {
+    alert('Network error: ' + e.message);
+  }
+}
+
+async function showQr(id) {
+  const container = document.getElementById('modalQr');
+  container.innerHTML = `<div class="meta" style="text-align:center;">Loading QR...</div>`;
+  try {
+    const res = await fetch(`${api}/guests/${encodeURIComponent(id)}/qr`, {
+      headers: { 'X-Staff-Pin': pin },
+    });
+    if (!res.ok) {
+      container.innerHTML = `<div class="meta" style="text-align:center;">QR failed (${res.status})</div>`;
+      return;
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    container.innerHTML = `
+      <img class="qr-img" src="${url}" alt="QR">
+      <div class="row-actions">
+        <button onclick="shareQr('${id}', this)">Share</button>
+        <a href="${url}" download="${id}.png" style="flex:1;">
+          <button class="secondary" style="width:100%;">Download</button>
+        </a>
+      </div>`;
+  } catch (e) {
+    container.innerHTML = `<div class="meta">Network error</div>`;
+  }
+}
+
+async function shareQr(id, btn) {
+  try {
+    const res = await fetch(`${api}/guests/${encodeURIComponent(id)}/qr`, {
+      headers: { 'X-Staff-Pin': pin },
+    });
+    const blob = await res.blob();
+    const file = new File([blob], `${id}.png`, { type: 'image/png' });
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      await navigator.share({ files: [file], title: 'Your party QR' });
+    } else {
+      alert('Sharing not supported on this device — use Download instead.');
+    }
+  } catch (e) {
+    if (e.name !== 'AbortError') alert('Share failed: ' + e.message);
+  }
+}
+
+async function submitAdd() {
+  const name = document.getElementById('addName').value.trim();
+  const party = parseInt(document.getElementById('addParty').value, 10) || 1;
+  const table = document.getElementById('addTable').value.trim();
+  if (!name) { alert('Name required.'); return; }
+
+  try {
+    const res = await fetch(`${api}/guests`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Staff-Pin': pin },
+      body: JSON.stringify({ name, party_size: party, table }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      alert('Failed: ' + (err.detail || res.status));
+      return;
+    }
+    const data = await res.json();
+    const id = data.id;
+    document.getElementById('addName').value = '';
+    document.getElementById('addParty').value = '1';
+    document.getElementById('addTable').value = '';
+    refreshStats();
+
+    const out = document.getElementById('addResult');
+    out.innerHTML = `
+      <div class="result ok" style="margin-top:18px;">
+        <div class="icon">✓</div>
+        <div class="name">${escapeHtml(name)}</div>
+        <div class="meta">Party of ${party}${table ? ` · table ${escapeHtml(table)}` : ''}</div>
+        <div id="newQr"></div>
+      </div>`;
+
+    const qrRes = await fetch(`${api}/guests/${encodeURIComponent(id)}/qr`, {
+      headers: { 'X-Staff-Pin': pin },
+    });
+    const blob = await qrRes.blob();
+    const url = URL.createObjectURL(blob);
+    document.getElementById('newQr').innerHTML = `
+      <img class="qr-img" src="${url}" alt="QR">
+      <div class="row-actions">
+        <button onclick="shareQr('${id}', this)">Share</button>
+        <a href="${url}" download="${escapeHtml(name).replace(/[^a-z0-9]/gi,'_')}_${id}.png" style="flex:1;">
+          <button class="secondary" style="width:100%;">Download</button>
+        </a>
+      </div>`;
+  } catch (e) {
+    alert('Network error: ' + e.message);
+  }
 }
 
 function startScanner() {
